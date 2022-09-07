@@ -45,15 +45,19 @@ void printLastError(LPCWSTR errdetails) {
 	wprintf(L"%ls : %ls\n", errdetails,errorbuffer);
 }
 
-int clone(wchar_t* src, wchar_t* tgt)
+wchar_t src[SUPERMAXPATH] = { 0 };
+
+DWORD WINAPI clone(LPVOID lpThreadParameter)
 {
+	wchar_t *tgt = (wchar_t*)lpThreadParameter;
+
 	//return code != 0 => error
 	int returncode = 0;
 
 	//some api call require a pointer to a dword although it is not used
 	LPDWORD dummyptr = { 0 };
 
-	wprintf(L"Cloning %s to %s.\n", src, tgt);
+	//wprintf(L"Cloning %s to %s.\n", src, tgt);
 
 	//check if source exits and make sure target does not exists
 	if (PathFileExists(src)) {
@@ -103,7 +107,7 @@ int clone(wchar_t* src, wchar_t* tgt)
 						//it makes sense that target is sparse so it doesn't consume disk space for blocks that are 0
 						if (preallocerr == 0) {
 							if (filebasicinfo.FileAttributes | FILE_ATTRIBUTE_SPARSE_FILE) {
-								printf("Original file is sparse, copying\n");
+								//printf("Original file is sparse, copying\n");
 								FILE_SET_SPARSE_BUFFER sparse = { true };
 								DeviceIoControl(tgthandle, FSCTL_SET_SPARSE, &sparse, sizeof(sparse), NULL, 0, dummyptr, NULL);
 								preallocerr = GetLastError();
@@ -117,7 +121,7 @@ int clone(wchar_t* src, wchar_t* tgt)
 
 							//query the info from src
 							if (DeviceIoControl(srchandle, FSCTL_GET_INTEGRITY_INFORMATION, NULL, 0, &integinfo, sizeof(integinfo), &written, NULL)) {
-								printf("Copied integrity info (%d)\n", integinfo.ChecksumAlgorithm);
+								//printf("Copied integrity info (%d)\n", integinfo.ChecksumAlgorithm);
 								clusterSize = integinfo.ClusterSizeInBytes;
 
 								//setting the info to tgt
@@ -130,7 +134,7 @@ int clone(wchar_t* src, wchar_t* tgt)
 						//sparse setting should be done first so it doesn't consume space on disk
 						if (preallocerr == 0) {
 							FILE_END_OF_FILE_INFO preallocsz = { filesz };
-							printf("Setting file end at %lld\n", filesz.QuadPart);
+							//printf("Setting file end at %lld\n", filesz.QuadPart);
 							SetFileInformationByHandle(tgthandle, FileEndOfFileInfo, &preallocsz, sizeof(preallocsz));
 							preallocerr = GetLastError();
 						}
@@ -139,7 +143,7 @@ int clone(wchar_t* src, wchar_t* tgt)
 							DWORD cperr = 0;
 
 							//file handle are setup, we can start cloning
-							wprintf(L"ReFS CP : \n%ls (%lld)\n -> %ls\n", fullsrc, filesz.QuadPart, fulltgt);
+							wprintf(L"ReFS CP : %ls (%lld) -> %ls\n", fullsrc, filesz.QuadPart, fulltgt);
 
 							
 							LONGLONG mask = ((LONGLONG)clusterSize) - 1;
@@ -166,7 +170,7 @@ int clone(wchar_t* src, wchar_t* tgt)
 								clonestruct.TargetFileOffset.QuadPart = cpoffset;
 								clonestruct.Flags = 0;
 
-								wprintf(L"Cloning offset %lld size %lld\n", clonestruct.SourceFileOffset.QuadPart, clonestruct.ByteCount.QuadPart);
+								//wprintf(L"Cloning offset %lld size %lld\n", clonestruct.SourceFileOffset.QuadPart, clonestruct.ByteCount.QuadPart);
 
 								//calling the duplicate "API" with out previous defined struct
 								DeviceIoControl(tgthandle, FSCTL_DUPLICATE_EXTENTS_TO_FILE_EX, &clonestruct, sizeof(clonestruct), NULL, 0, dummyptr, NULL);
@@ -179,7 +183,7 @@ int clone(wchar_t* src, wchar_t* tgt)
 								returncode = 20;
 							}
 							else {
-								printf("Cloned without errors\n");
+								//printf("Cloned without errors\n");
 							}
 
 						}
@@ -215,7 +219,8 @@ int clone(wchar_t* src, wchar_t* tgt)
 		wprintf(L"Src does not exists %s\n", src);
 		returncode = 12;
 	}
-	return returncode;
+
+	return (DWORD)returncode;
 }
 
 int main(int argc, char* argv[])
@@ -226,24 +231,22 @@ int main(int argc, char* argv[])
 	//need at least src and dest file
 	if (argc > 2) {
 		//converting regular char* to wide char because most windows api call accept it
-		wchar_t src[SUPERMAXPATH] = { 0 };
 		MultiByteToWideChar(0, 0, argv[1], (int)strlen(argv[1]), src, (int)strlen(argv[1]));
 
-		for (DWORD i = 0; i < 327; i++)
+		HANDLE hThreads[8175];
+		for (DWORD i = 0; i < _countof(hThreads); i++)
 		{
 			wchar_t tgt_prefix[SUPERMAXPATH] = { 0 };
 			MultiByteToWideChar(0, 0, argv[2], (int)strlen(argv[2]), tgt_prefix, (int)strlen(argv[2]));
 
-			wchar_t tgt[SUPERMAXPATH] = { 0 };
+			wchar_t* tgt = new wchar_t[SUPERMAXPATH];
 
 			wsprintf(tgt, L"%s_%d", tgt_prefix, i);
-			returncode = clone(src, tgt);
-			if (returncode != 0) {
-				return returncode;
-			}
+
+			hThreads[i] = CreateThread(NULL, 0, clone, (LPVOID)tgt, 0, NULL);
 		}
 
-
+		WaitForMultipleObjects(_countof(hThreads), hThreads, TRUE, INFINITE);
 	}
 	else {
 		printf("refs-fclone.exe <src> <tgt>\n");
