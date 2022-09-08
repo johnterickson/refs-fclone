@@ -46,9 +46,14 @@ void printLastError(LPCWSTR errdetails) {
 }
 
 wchar_t src[SUPERMAXPATH] = { 0 };
+HANDLE hEvent;
+
+#define RETURN_ERROR {DWORD err = GetLastError();  printf("FAILED AT %d: 0x%x", __LINE__, err); return err;}
 
 DWORD WINAPI clone(LPVOID lpThreadParameter)
 {
+	WaitForSingleObject(hEvent, INFINITE);
+
 	wchar_t *tgt = (wchar_t*)lpThreadParameter;
 
 	//return code != 0 => error
@@ -60,167 +65,175 @@ DWORD WINAPI clone(LPVOID lpThreadParameter)
 	//wprintf(L"Cloning %s to %s.\n", src, tgt);
 
 	//check if source exits and make sure target does not exists
-	if (PathFileExists(src)) {
-		if (!PathFileExists(tgt)) {
+	if (!PathFileExists(src)) {
+		wprintf(L"Src does not exists %s\n", src);
+		return 12;
+	}
+	if (PathFileExists(tgt)) {
+		wprintf(L"Tgt already exists %s\n", tgt);
+		return 13;
+	}
 
-			//getting the full path (although it is just for visualisation)
-			wchar_t fullsrc[SUPERMAXPATH] = { 0 };
-			TCHAR** lppsrcPart = { NULL };
-			wchar_t fulltgt[SUPERMAXPATH] = { 0 };
-			TCHAR** lpptgtPart = { NULL };
+	//getting the full path (although it is just for visualisation)
+	wchar_t fullsrc[SUPERMAXPATH] = { 0 };
+	TCHAR** lppsrcPart = { NULL };
+	wchar_t fulltgt[SUPERMAXPATH] = { 0 };
+	TCHAR** lpptgtPart = { NULL };
 
-			GetFullPathName(src, SUPERMAXPATH, fullsrc, lppsrcPart);
-			GetFullPathName(tgt, SUPERMAXPATH, fulltgt, lpptgtPart);
+	GetFullPathName(src, SUPERMAXPATH, fullsrc, lppsrcPart);
+	GetFullPathName(tgt, SUPERMAXPATH, fulltgt, lpptgtPart);
 
-			//opening the source path for reading
-			HANDLE srchandle = CreateFile(fullsrc, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	//opening the source path for reading
+	HANDLE srchandle = CreateFile(fullsrc, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
-			//if we can open it query details
-			if (srchandle != INVALID_HANDLE_VALUE) {
+	//if we can open it query details
+	if (srchandle == INVALID_HANDLE_VALUE) {
+		RETURN_ERROR;
+	}
 
-				//what is the file size
-				LARGE_INTEGER filesz = { 0 };
-				GetFileSizeEx(srchandle, &filesz);
+	//what is the file size
+	LARGE_INTEGER filesz = { 0 };
+	if (!GetFileSizeEx(srchandle, &filesz)) {
+		RETURN_ERROR;
+	}
 
-				//basic file info, required to check if the file is sparse (copied from other project)
-				FILE_BASIC_INFO filebasicinfo = { 0 };
-				GetFileInformationByHandleEx(srchandle, FileBasicInfo, &filebasicinfo, sizeof(filebasicinfo));
+	//basic file info, required to check if the file is sparse (copied from other project)
+	FILE_BASIC_INFO filebasicinfo = { 0 };
+	if (!GetFileInformationByHandleEx(srchandle, FileBasicInfo, &filebasicinfo, sizeof(filebasicinfo))) {
+		RETURN_ERROR;
+	}
 
-				//check if the filesystem allows cloning
-				ULONG fsflags = 0;
-				GetVolumeInformationByHandleW(srchandle, NULL, 0, NULL, NULL, &fsflags, NULL, 0);
+	//check if the filesystem allows cloning
+	ULONG fsflags = 0;
+	if (!GetVolumeInformationByHandleW(srchandle, NULL, 0, NULL, NULL, &fsflags, NULL, 0)) {
+		RETURN_ERROR;
+	}
 
-				if (fsflags & FILE_SUPPORTS_BLOCK_REFCOUNTING)
-				{
-					//opening the target file for writing
-					//create always
-					HANDLE tgthandle = CreateFile(fulltgt, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-					if (tgthandle != INVALID_HANDLE_VALUE) {
-						//https://technet.microsoft.com/en-us/windows-server-docs/storage/refs/block-cloning
-						//must be sparse or not sparse
-						//must have same integrity or not
-						//must have same file length
-						DWORD preallocerr = 0;
-						DWORD written = 0;
+	if ((fsflags & FILE_SUPPORTS_BLOCK_REFCOUNTING) == 0)
+	{
+		return 1000;
+	}
 
-						//make sure the file is sparse if the sourse is sparse
-						//it makes sense that target is sparse so it doesn't consume disk space for blocks that are 0
-						if (preallocerr == 0) {
-							if (filebasicinfo.FileAttributes | FILE_ATTRIBUTE_SPARSE_FILE) {
-								//printf("Original file is sparse, copying\n");
-								FILE_SET_SPARSE_BUFFER sparse = { true };
-								DeviceIoControl(tgthandle, FSCTL_SET_SPARSE, &sparse, sizeof(sparse), NULL, 0, dummyptr, NULL);
-								preallocerr = GetLastError();
-							}
-						}
+	//opening the target file for writing
+	//create always
+	HANDLE tgthandle = CreateFile(fulltgt, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (tgthandle == INVALID_HANDLE_VALUE) {
+		printLastError(L"Issue opening target handle");
+		RETURN_ERROR;
+	}
 
-						DWORD clusterSize;
-						//integrity scan info must be the same for block cloning in both files
-						if (preallocerr == 0) {
-							FSCTL_GET_INTEGRITY_INFORMATION_BUFFER integinfo = { 0 };
+	//https://technet.microsoft.com/en-us/windows-server-docs/storage/refs/block-cloning
+	//must be sparse or not sparse
+	//must have same integrity or not
+	//must have same file length
+	DWORD written = 0;
 
-							//query the info from src
-							if (DeviceIoControl(srchandle, FSCTL_GET_INTEGRITY_INFORMATION, NULL, 0, &integinfo, sizeof(integinfo), &written, NULL)) {
-								//printf("Copied integrity info (%d)\n", integinfo.ChecksumAlgorithm);
-								clusterSize = integinfo.ClusterSizeInBytes;
+	//make sure the file is sparse if the sourse is sparse
+	//it makes sense that target is sparse so it doesn't consume disk space for blocks that are 0
+	if (filebasicinfo.FileAttributes | FILE_ATTRIBUTE_SPARSE_FILE) {
+		//printf("Original file is sparse, copying\n");
+		FILE_SET_SPARSE_BUFFER sparse = { true };
+		if (!DeviceIoControl(tgthandle, FSCTL_SET_SPARSE, &sparse, sizeof(sparse), NULL, 0, dummyptr, NULL)) {
+			RETURN_ERROR;
+		}
+	}
 
-								//setting the info to tgt
-								DeviceIoControl(tgthandle, FSCTL_SET_INTEGRITY_INFORMATION, &integinfo, sizeof(integinfo), NULL, 0, dummyptr, NULL);
-								preallocerr = GetLastError();
-							}
-						}
-						//setting the file end of the target to the size of the source
-						//this basically makes the file as big as the source instead of 0kb, before cloning
-						//sparse setting should be done first so it doesn't consume space on disk
-						if (preallocerr == 0) {
-							FILE_END_OF_FILE_INFO preallocsz = { filesz };
-							//printf("Setting file end at %lld\n", filesz.QuadPart);
-							SetFileInformationByHandle(tgthandle, FileEndOfFileInfo, &preallocsz, sizeof(preallocsz));
-							preallocerr = GetLastError();
-						}
+	DWORD clusterSize;
+	//integrity scan info must be the same for block cloning in both files
+	{
+		FSCTL_GET_INTEGRITY_INFORMATION_BUFFER integinfo = { 0 };
 
-						if (preallocerr == 0 && tgthandle != INVALID_HANDLE_VALUE && srchandle != INVALID_HANDLE_VALUE) {
-							DWORD cperr = 0;
+		//query the info from src
+		if (!DeviceIoControl(srchandle, FSCTL_GET_INTEGRITY_INFORMATION, NULL, 0, &integinfo, sizeof(integinfo), &written, NULL)) {
+			RETURN_ERROR;
+		}
 
-							//file handle are setup, we can start cloning
-							wprintf(L"ReFS CP : %ls (%lld) -> %ls\n", fullsrc, filesz.QuadPart, fulltgt);
+		//printf("Copied integrity info (%d)\n", integinfo.ChecksumAlgorithm);
+		clusterSize = integinfo.ClusterSizeInBytes;
+
+		//setting the info to tgt
+		if (!DeviceIoControl(tgthandle, FSCTL_SET_INTEGRITY_INFORMATION, &integinfo, sizeof(integinfo), NULL, 0, dummyptr, NULL)) {
+			RETURN_ERROR;
+		}
+	}
+
+	//setting the file end of the target to the size of the source
+	//this basically makes the file as big as the source instead of 0kb, before cloning
+	//sparse setting should be done first so it doesn't consume space on disk
+	FILE_END_OF_FILE_INFO preallocsz = { filesz };
+	//printf("Setting file end at %lld\n", filesz.QuadPart);
+	if (!SetFileInformationByHandle(tgthandle, FileEndOfFileInfo, &preallocsz, sizeof(preallocsz))) {
+		RETURN_ERROR;
+	}
+
+	//file handle are setup, we can start cloning
+	//wprintf(L"ReFS CP : %ls (%lld) -> %ls\n", fullsrc, filesz.QuadPart, fulltgt);
 
 							
-							LONGLONG mask = ((LONGLONG)clusterSize) - 1;
-							filesz.QuadPart = (filesz.QuadPart + mask) & ~mask;
+	LONGLONG mask = ((LONGLONG)clusterSize) - 1;
+	filesz.QuadPart = (filesz.QuadPart + mask) & ~mask;
 
-							//longlong required because basic long is only value of +- 4GB
-							//also the block clone require large integers which are basically struct with longlong integers for 64bit server
-							//the clone also copies a max of 4GB per time, however here it is limited to CLONESZ
-							for (LONGLONG cpoffset = 0; cpoffset < filesz.QuadPart && cperr == 0; cpoffset += CLONESZ) {
-								LONGLONG cpblocks = CLONESZ;
+	//longlong required because basic long is only value of +- 4GB
+	//also the block clone require large integers which are basically struct with longlong integers for 64bit server
+	//the clone also copies a max of 4GB per time, however here it is limited to CLONESZ
+	for (LONGLONG cpoffset = 0; cpoffset < filesz.QuadPart; cpoffset += CLONESZ) {
+		LONGLONG cpblocks = CLONESZ;
 
-								//if the offset + the amount of blocks is bigger then CLONESZ, we need to copy a smaller amount
-								if ((cpoffset + cpblocks) > filesz.QuadPart) {
-									cpblocks = filesz.QuadPart - cpoffset;
-								}
-
-
-								//setting up the struct. since we want identical files, we put the offset the same
-								DUPLICATE_EXTENTS_DATA_EX clonestruct;
-								clonestruct.Size = sizeof(DUPLICATE_EXTENTS_DATA_EX);
-								clonestruct.FileHandle = srchandle;
-								clonestruct.ByteCount.QuadPart = cpblocks;
-								clonestruct.SourceFileOffset.QuadPart = cpoffset;
-								clonestruct.TargetFileOffset.QuadPart = cpoffset;
-								clonestruct.Flags = 0;
-
-								//wprintf(L"Cloning offset %lld size %lld\n", clonestruct.SourceFileOffset.QuadPart, clonestruct.ByteCount.QuadPart);
-
-								//calling the duplicate "API" with out previous defined struct
-								DeviceIoControl(tgthandle, FSCTL_DUPLICATE_EXTENTS_TO_FILE_EX, &clonestruct, sizeof(clonestruct), NULL, 0, dummyptr, NULL);
-
-								cperr = GetLastError();
-							}
-
-							if (cperr) {
-								printLastError(L"Error issuing Device IO Control statement (sure this is ReFS3.1 on Windows 2016?)");
-								returncode = 20;
-							}
-							else {
-								//printf("Cloned without errors\n");
-							}
-
-						}
-						else {
-							printLastError(L"Error preallocating file");
-							returncode = 17;
-						}
-
-						CloseHandle(tgthandle);
-					}
-					else {
-						printLastError(L"Issue opening target handle");
-						returncode = 16;
-					}
-				}
-				else {
-					printf("Original file does not support cloning");
-					returncode = 15;
-				}
-				CloseHandle(srchandle);
-			}
-			else {
-				printLastError(L"Issue opening source handle");
-				returncode = 14;
-			}
+		//if the offset + the amount of blocks is bigger then CLONESZ, we need to copy a smaller amount
+		if ((cpoffset + cpblocks) > filesz.QuadPart) {
+			cpblocks = filesz.QuadPart - cpoffset;
 		}
-		else {
-			wprintf(L"Tgt already exists %s\n", tgt);
-			returncode = 13;
+
+
+		//setting up the struct. since we want identical files, we put the offset the same
+		DUPLICATE_EXTENTS_DATA_EX clonestruct;
+		clonestruct.Size = sizeof(DUPLICATE_EXTENTS_DATA_EX);
+		clonestruct.FileHandle = srchandle;
+		clonestruct.ByteCount.QuadPart = cpblocks;
+		clonestruct.SourceFileOffset.QuadPart = cpoffset;
+		clonestruct.TargetFileOffset.QuadPart = cpoffset;
+		clonestruct.Flags = 0;
+
+		//wprintf(L"Cloning offset %lld size %lld\n", clonestruct.SourceFileOffset.QuadPart, clonestruct.ByteCount.QuadPart);
+
+		//calling the duplicate "API" with out previous defined struct
+		if (!DeviceIoControl(tgthandle, FSCTL_DUPLICATE_EXTENTS_TO_FILE_EX, &clonestruct, sizeof(clonestruct), NULL, 0, dummyptr, NULL)) {
+			RETURN_ERROR;
 		}
 	}
-	else {
-		wprintf(L"Src does not exists %s\n", src);
-		returncode = 12;
+
+	CloseHandle(tgthandle);
+	CloseHandle(srchandle);
+
+	tgthandle = CreateFile(fulltgt, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (tgthandle == INVALID_HANDLE_VALUE) {
+		printLastError(L"Issue opening target handle");
+		RETURN_ERROR;
 	}
 
-	return (DWORD)returncode;
+	BYTE contents[100];
+	DWORD bytesRead;
+	if (!ReadFile(tgthandle, contents, _countof(contents), &bytesRead, NULL)) {
+		RETURN_ERROR;
+	}
+
+	if (bytesRead == 0) {
+		return 1001;
+	}
+
+	CloseHandle(tgthandle);
+
+	BYTE merged = 0;
+	for (DWORD i = 0; i < bytesRead; i++) {
+		merged |= contents[i];
+	}
+
+	if (merged == 0) {
+		return 1002;
+	}
+
+	delete tgt;
+	return 0;
 }
 
 int main(int argc, char* argv[])
@@ -233,6 +246,11 @@ int main(int argc, char* argv[])
 		//converting regular char* to wide char because most windows api call accept it
 		MultiByteToWideChar(0, 0, argv[1], (int)strlen(argv[1]), src, (int)strlen(argv[1]));
 
+		hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		if (hEvent == NULL) {
+			RETURN_ERROR;
+		}
+
 		HANDLE hThreads[8175];
 		for (DWORD i = 0; i < _countof(hThreads); i++)
 		{
@@ -244,9 +262,28 @@ int main(int argc, char* argv[])
 			wsprintf(tgt, L"%s_%d", tgt_prefix, i);
 
 			hThreads[i] = CreateThread(NULL, 0, clone, (LPVOID)tgt, 0, NULL);
+			if (hThreads[i] == NULL) {
+				RETURN_ERROR;
+			}
 		}
 
-		WaitForMultipleObjects(_countof(hThreads), hThreads, TRUE, INFINITE);
+		if (!SetEvent(hEvent)) {
+			RETURN_ERROR;
+		}
+
+		for (DWORD i = 0; i < _countof(hThreads); i++) {
+			DWORD exitCode;
+			WaitForSingleObject(hThreads[i], INFINITE);
+			if (!GetExitCodeThread(hThreads[i], &exitCode)) {
+				RETURN_ERROR;
+			}
+
+			if (exitCode != 0) {
+				printf("ERROR thread %d exit code: 0x%x", i, exitCode);
+				return exitCode;
+
+			}
+		}
 	}
 	else {
 		printf("refs-fclone.exe <src> <tgt>\n");
