@@ -5,3 +5,5 @@ for /L %%I IN (1,1,1000) DO (
 	D:\src\refs-fclone\x64\Debug\refs-fclone.exe R:\hello.txt R:\test\blob
 	if "!ERRORLEVEL!" NEQ "0" exit !ERRORLEVEL!
 )
+
+REM sha256sum blob* | awk '{print $1;}'  | sort | uniq
