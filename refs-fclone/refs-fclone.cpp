@@ -99,6 +99,8 @@ DWORD WINAPI clone(LPVOID lpThreadParameter)
 		//opening the source path for reading
 		HANDLE srchandle = CreateFile(fullsrc, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
+		FlushFileBuffers(srchandle);
+
 		//if we can open it query details
 		if (srchandle == INVALID_HANDLE_VALUE) {
 			RETURN_ERROR;
@@ -289,6 +291,7 @@ int main(int argc, char* argv[])
 			if (!MoveFileW(src_tmp, src)) {
 				RETURN_ERROR;
 			}
+			
 			InterlockedExchange(&threadsReady, 0);
 			printf("Repro attempt...");
 			hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
